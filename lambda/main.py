@@ -54,23 +54,16 @@ def get_user(schedule_id):
     normal = json.loads(body)
     try:
         username = normal['users'][0]['name']
-        # Check for overrides
-        # If there is *any* override, then the above username is an override
-        # over the normal schedule. The problem must be approached this way
-        # because the /overrides endpoint does not guarentee an order of the
-        # output.
-        override_response = http.request('GET', override_url, headers=headers, fields=payload)
-        body = override_response.data.decode('utf-8')
-        override = json.loads(body)
-        if override['overrides']:  # is not empty list
-            username = username + " (Override)"
+        email = normal['users'][0]['email']
     except IndexError:
         username = "No One :thisisfine:"
+        email = None
     except KeyError:
         username = f"Deactivated User :scream: ({normal['users'][0]['summary']})"
+        email = None
 
     logger.info("Currently on call: {}".format(username))
-    return username
+    return (username, email)
 
 
 def get_pd_schedule_name(schedule_id):
@@ -107,6 +100,22 @@ def get_slack_topic(channel):
         logger.critical("Could not find '{}' on slack, has the on-call bot been removed from this channel?".format(channel))
     return current
 
+def get_slack_user_id(email):
+    payload = {}
+    payload['token'] = boto3.client('ssm').get_parameters(
+        Names=[os.environ['SLACK_API_KEY_NAME']],
+        WithDecryption=True)['Parameters'][0]['Value']
+    payload['email'] = email
+    try:
+        response = http.request('POST', 'https://slack.com/api/users.lookupByEmail', fields=payload)
+        body = response.data.decode('utf-8')
+        r = json.loads(body)
+        user_id = r['user']['id']
+        logger.debug("User Id for email {}: '{}'".format(email, user_id))
+    except KeyError:
+        logger.critical("Could not find '{}' on slack, maybe a different email?".format(email))
+        user_id = None
+    return user_id
 
 def update_slack_topic(channel, proposed_update):
     logger.debug("Entered update_slack_topic() with: {} {}".format(
@@ -205,12 +214,12 @@ def do_work(obj):
     # schedule will ALWAYS be there, it is a ddb primarykey
     schedules = obj['schedule']['S']
     schedule_list = schedules.split(',')
-    oncall_dict = {}
+    oncall_list = []
     for schedule in schedule_list:  #schedule can now be a whitespace separated 'list' in a string
         schedule = figure_out_schedule(schedule)
 
         if schedule:
-            username = get_user(schedule)
+            user, email = get_user(schedule)
         else:
             logger.critical("Exiting: Schedule not found or not valid, see previous errors")
             return 127
@@ -219,17 +228,24 @@ def do_work(obj):
             sched_name = sched_names[schedule_list.index(schedule)] #We want the schedule name in the same position as the schedule we're using
         except:
             sched_name = get_pd_schedule_name(schedule)
-        oncall_dict[username] = sched_name
+        oncall_list.append((sched_name, user, email))
 
-    if oncall_dict:  # then it is valid and update the chat topic
+    if oncall_list:  # then it is valid and update the chat topic
         topic = ""
         i = 0
-        for user in oncall_dict:
+        for t in oncall_list:
             if i != 0:
                 topic += ", "
-            topic += "{} is on-call for {}".format(
-                user,
-                oncall_dict[user]
+            sched, user, email = t
+            slack_user_id = None
+            if email:
+                slack_user_id = get_slack_user_id(email)
+            if slack_user_id:
+                # use slack link to mention the person
+                user = "<@{}>".format(slack_user_id)
+            topic += "{}: {}".format(
+                sched,
+                user
             )
             i += 1
 
